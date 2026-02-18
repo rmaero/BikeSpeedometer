@@ -4,15 +4,19 @@
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "led_strip.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-#define SIGNAL_GPIO         GPIO_NUM_4
-#define TIMER_RESOLUTION_HZ 40000000    // 40 MHz → 25 ns per tick (max for gptimer)
+#define SIGNAL_GPIO         GPIO_NUM_27  // Hall sensor input
+#define LED_GPIO            GPIO_NUM_4   // Addressable LED data pin
+#define LED_STRIP_LENGTH    1            // Number of LEDs
+#define TIMER_RESOLUTION_HZ 40000000     // 40 MHz → 25 ns per tick (max for gptimer)
 
 #define UART_PORT           UART_NUM_0
 #define UART_BAUD           115200
@@ -23,7 +27,13 @@
 #define RING_BUF_SIZE       16
 #define RING_BUF_MASK       (RING_BUF_SIZE - 1)
 
-// ─── Ring buffer ─────────────────────────────────────────────────────────────
+#define LED_PULSE_MS        20           // LED pulse duration in milliseconds
+
+// Bicycle wheel configuration
+#define MAGNETS_PER_REV     4            // Number of magnets on the wheel
+#define WHEEL_DIAMETER_MM   700          // Wheel diameter in millimeters
+
+// ─── Ring buffers ────────────────────────────────────────────────────────────
 
 typedef struct {
     uint64_t data[RING_BUF_SIZE];
@@ -31,7 +41,11 @@ typedef struct {
     volatile uint32_t read_idx;
 } ring_buf_t;
 
-static ring_buf_t ring = {0};
+// Ring buffer for direct method (consecutive pulse differences)
+static ring_buf_t ring_direct = {0};
+
+// Ring buffer for universal counter method (alternating measurement windows)
+static ring_buf_t ring_counter = {0};
 
 static inline bool IRAM_ATTR ring_push(ring_buf_t *rb, uint64_t value)
 {
@@ -57,8 +71,19 @@ static inline bool ring_pop(ring_buf_t *rb, uint64_t *out)
 // ─── Globals ─────────────────────────────────────────────────────────────────
 
 static gptimer_handle_t gptimer = NULL;
-static volatile uint64_t last_timestamp = 0;
-static volatile bool     first_edge     = true;
+static led_strip_handle_t led_strip = NULL;
+
+// Direct measurement state
+static volatile uint64_t last_timestamp_direct = 0;
+static volatile bool     first_edge_direct     = true;
+
+// Universal counter state
+static volatile uint64_t window_start = 0;       // Timestamp when counting window opened
+static volatile uint64_t calculated_period = 0;  // Period calculated during previous window
+static volatile uint8_t  pulse_count = 0;        // Counts pulses: 0, 1, 2, 3, 0, 1, 2, 3...
+static volatile bool     first_edge_counter = true;
+
+static volatile bool     trigger_led    = false;
 
 // ─── ISR ─────────────────────────────────────────────────────────────────────
 
@@ -67,13 +92,35 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     uint64_t now = 0;
     gptimer_get_raw_count(gptimer, &now);
 
-    if (first_edge) {
-        first_edge = false;
+    // ─── Method 1: Direct consecutive pulse measurement ─────────────────────
+    if (first_edge_direct) {
+        first_edge_direct = false;
     } else {
-        ring_push(&ring, now - last_timestamp);
+        ring_push(&ring_direct, now - last_timestamp_direct);
+    }
+    last_timestamp_direct = now;
+
+    // ─── Method 2: Universal counter (alternating windows) ──────────────────
+    if (first_edge_counter) {
+        // Very first pulse ever - just initialize
+        window_start = now;
+        pulse_count = 1;
+        first_edge_counter = false;
+    } else {
+        pulse_count++;
+        
+        if (pulse_count == 2) {
+            // Second pulse: close the counting window and calculate period
+            calculated_period = now - window_start;
+        } else if (pulse_count == 3) {
+            // Third pulse: push the calculated period and open new window
+            ring_push(&ring_counter, calculated_period);
+            window_start = now;
+            pulse_count = 1;  // Reset for next window (this is pulse 1 of next window)
+        }
     }
 
-    last_timestamp = now;
+    trigger_led = true;
 }
 
 // ─── UART init ───────────────────────────────────────────────────────────────
@@ -99,9 +146,9 @@ static void init_uart(void)
 static void init_timer(void)
 {
     gptimer_config_t timer_config = {
-        .clk_src       = GPTIMER_CLK_SRC_APB,  // 80 MHz base clock
+        .clk_src       = GPTIMER_CLK_SRC_APB,
         .direction     = GPTIMER_COUNT_UP,
-        .resolution_hz = TIMER_RESOLUTION_HZ,  // Divide by 2 → 40 MHz
+        .resolution_hz = TIMER_RESOLUTION_HZ,
     };
 
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
@@ -109,60 +156,183 @@ static void init_timer(void)
     ESP_ERROR_CHECK(gptimer_start(gptimer));
 }
 
+// ─── LED strip init ──────────────────────────────────────────────────────────
+
+static void init_led_strip(void)
+{
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_GPIO,
+        .max_leds = LED_STRIP_LENGTH,
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    led_strip_clear(led_strip);
+}
+
 // ─── GPIO init ───────────────────────────────────────────────────────────────
 
 static void init_gpio(void)
 {
-    gpio_config_t io_conf = {
+    gpio_config_t input_conf = {
         .pin_bit_mask = (1ULL << SIGNAL_GPIO),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_NEGEDGE,
     };
-
-    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_config(&input_conf));
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SIGNAL_GPIO, gpio_isr_handler, NULL));
 }
 
-// ─── Main loop ───────────────────────────────────────────────────────────────
+// ─── LED control task ────────────────────────────────────────────────────────
+
+static void led_task(void *arg)
+{
+    TickType_t led_off_time = 0;
+    bool led_is_on = false;
+
+    while (1) {
+        if (trigger_led) {
+            trigger_led = false;
+            
+            led_strip_set_pixel(led_strip, 0, 0, 255, 0);  // Green
+            led_strip_refresh(led_strip);
+            
+            led_is_on = true;
+            led_off_time = xTaskGetTickCount() + pdMS_TO_TICKS(LED_PULSE_MS);
+        }
+
+        if (led_is_on && (xTaskGetTickCount() >= led_off_time)) {
+            led_strip_clear(led_strip);
+            led_is_on = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ─── Helper function for speed/RPM calculation ───────────────────────────────
+
+static void calculate_and_print(uint64_t ticks, const char* method_name, float wheel_circumference_m)
+{
+    char buf[160];
+    
+    float period_s = (float)ticks / (float)TIMER_RESOLUTION_HZ;
+    float time_per_rev_s = period_s * MAGNETS_PER_REV;
+    float rpm = 60.0f / time_per_rev_s;
+    
+    float distance_per_pulse_m = wheel_circumference_m / MAGNETS_PER_REV;
+    float speed_ms = distance_per_pulse_m / period_s;
+    float speed_kmh = speed_ms * 3.6f;
+
+    int len = snprintf(buf, sizeof(buf),
+                       "[%s] Speed: %.2f km/h | RPM: %.1f | Period: %.3f ms\r\n",
+                       method_name,
+                       speed_kmh,
+                       rpm,
+                       period_s * 1000.0f);
+
+    uart_write_bytes(UART_PORT, buf, len);
+}
+
+// ─── Processing task ─────────────────────────────────────────────────────────
+
+static void measurement_task(void *arg)
+{
+    uint64_t ticks_direct;
+    uint64_t ticks_counter;
+    
+    float wheel_circumference_m = (M_PI * WHEEL_DIAMETER_MM) / 1000.0f;
+
+    while (1) {
+        bool has_direct = ring_pop(&ring_direct, &ticks_direct);
+        bool has_counter = ring_pop(&ring_counter, &ticks_counter);
+        
+        if (has_direct) {
+            calculate_and_print(ticks_direct, "DIRECT ", wheel_circumference_m);
+        }
+        
+        if (has_counter) {
+            calculate_and_print(ticks_counter, "COUNTER", wheel_circumference_m);
+        }
+        
+        // Print comparison if we have both measurements
+        if (has_direct && has_counter) {
+            int64_t diff_ticks = (int64_t)ticks_direct - (int64_t)ticks_counter;
+            float diff_ns = (float)diff_ticks * 25.0f;  // 25 ns per tick
+            
+            char comp_buf[128];
+            int len = snprintf(comp_buf, sizeof(comp_buf),
+                               ">>> Difference: %lld ticks (%.0f ns)\r\n\r\n",
+                               diff_ticks,
+                               diff_ns);
+            uart_write_bytes(UART_PORT, comp_buf, len);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 void app_main(void)
 {
     init_uart();
     init_timer();
+    init_led_strip();
     init_gpio();
 
-    const char *banner = "Pulse period measurement ready (25 ns resolution).\r\n";
-    uart_write_bytes(UART_PORT, banner, strlen(banner));
+    float wheel_circumference_m = (M_PI * WHEEL_DIAMETER_MM) / 1000.0f;
+    char banner[512];
+    int len = snprintf(banner, sizeof(banner),
+                       "\r\n=== Bicycle Speedometer - Dual Method Comparison ===\r\n"
+                       "Wheel diameter: %d mm\r\n"
+                       "Wheel circumference: %.3f m\r\n"
+                       "Magnets per revolution: %d\r\n"
+                       "Hall sensor: GPIO %d | LED: GPIO %d\r\n"
+                       "Timer resolution: 25 ns per tick\r\n\r\n"
+                       "Method 1 (DIRECT):  Consecutive pulse differences\r\n"
+                       "Method 2 (COUNTER): Universal counter (pulse 1->2, calculate, pulse 3 opens new window)\r\n"
+                       "======================================================\r\n\r\n",
+                       WHEEL_DIAMETER_MM,
+                       wheel_circumference_m,
+                       MAGNETS_PER_REV,
+                       SIGNAL_GPIO,
+                       LED_GPIO);
+    uart_write_bytes(UART_PORT, banner, len);
 
-    char buf[80];
-    uint64_t ticks;
-
-    while (1) {
-        if (ring_pop(&ring, &ticks)) {
-            // Convert ticks to nanoseconds
-            // ticks * (1e9 / TIMER_RESOLUTION_HZ) = ticks * 25
-            uint64_t period_ns   = ticks * 25;
-            uint32_t period_us   = (uint32_t)(period_ns / 1000);
-            uint32_t period_ns_frac = (uint32_t)(period_ns % 1000);
-
-            // Frequency calculation
-            uint32_t freq_hz  = (period_ns > 0) ? (uint32_t)(1000000000ULL / period_ns) : 0;
-            uint32_t freq_mhz = (period_ns > 0) ? (uint32_t)((1000000000000ULL / period_ns) % 1000) : 0;
-
-            int len = snprintf(buf, sizeof(buf),
-                               "Period: %lu.%03lu us | Freq: %lu.%03lu Hz\r\n",
-                               (unsigned long)period_us,
-                               (unsigned long)period_ns_frac,
-                               (unsigned long)freq_hz,
-                               (unsigned long)freq_mhz);
-
-            uart_write_bytes(UART_PORT, buf, len);
-        }
-        
-        // Yield to FreeRTOS IDLE task to feed the watchdog
-        vTaskDelay(1);  // Delay for 1 tick (~10ms) - won't affect measurement accuracy
-    }
+    xTaskCreate(led_task, "led", 2048, NULL, 10, NULL);
+    xTaskCreate(measurement_task, "measurement", 4096, NULL, 5, NULL);
+    
+    vTaskDelete(NULL);
 }
+
+/*
+```
+
+**How the universal counter method works:**
+
+1. **Pulse 1** arrives → Opens counting window, records timestamp
+2. **Pulse 2** arrives → Closes window, calculates period = (pulse2_time - pulse1_time)
+3. **Pulse 3** arrives → Outputs the calculated period, opens new window (pulse 3 becomes pulse 1 of next cycle)
+4. Repeat from step 2
+
+**Expected output:**
+```
+[DIRECT ] Speed: 25.34 km/h | RPM: 87.2 | Period: 172.413 ms
+[COUNTER] Speed: 25.34 km/h | RPM: 87.2 | Period: 172.413 ms
+>>> Difference: 0 ticks (0 ns)
+
+[DIRECT ] Speed: 25.32 km/h | RPM: 87.1 | Period: 172.500 ms
+>>> Difference: -3472 ticks (-86800 ns)
+*/
