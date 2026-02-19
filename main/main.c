@@ -24,19 +24,18 @@
 #define UART_RX_PIN         GPIO_NUM_3
 #define UART_BUF_SIZE       256
 
-#define RING_BUF_SIZE       32
+#define RING_BUF_SIZE       16
 #define RING_BUF_MASK       (RING_BUF_SIZE - 1)
 
 #define LED_PULSE_MS        20           // LED pulse duration in milliseconds
-#define TIMEOUT_MS          2500         // Timeout for detecting stopped wheel (2 seconds)
+#define TIMEOUT_MS          2200         // Timeout for detecting stopped wheel (2.2 seconds)
+
+// Missing magnet detection threshold
+#define ANOMALY_THRESHOLD   1.5f         // If a pulse is 1.5x longer than average, flag it
 
 // Bicycle wheel configuration
 #define MAGNETS_PER_REV     4            // Number of magnets on the wheel
 #define WHEEL_DIAMETER_MM   700          // Wheel diameter in millimeters
-
-// Magnet loss detection
-#define PERIOD_HISTORY_SIZE 8            // Number of periods to track for anomaly detection
-#define OUTLIER_THRESHOLD   1.7f         // Multiplier for detecting missing magnet (period > 1.7x average)
 
 // ─── Ring buffers ────────────────────────────────────────────────────────────
 
@@ -83,24 +82,21 @@ static volatile uint64_t last_timestamp_direct = 0;
 static volatile bool     first_edge_direct     = true;
 
 // Universal counter state
-static volatile uint64_t window_start = 0;
-static volatile uint64_t calculated_period = 0;
-static volatile uint8_t  pulse_count = 0;
+static volatile uint64_t window_start = 0;       // Timestamp when counting window opened
+static volatile uint64_t calculated_period = 0;  // Period calculated during previous window
+static volatile uint8_t  pulse_count = 0;        // Counts pulses: 0, 1, 2, 3, 0, 1, 2, 3...
 static volatile bool     first_edge_counter = true;
 
 static volatile bool     trigger_led    = false;
 
 // Timeout detection
-static volatile TickType_t last_pulse_time = 0;
+static volatile TickType_t last_pulse_time = 0;  // FreeRTOS tick when last pulse arrived
 
-// Period history for magnet loss detection
-typedef struct {
-    uint64_t periods[PERIOD_HISTORY_SIZE];
-    uint8_t index;
-    uint8_t count;
-} period_history_t;
-
-static period_history_t period_history = {0};
+// Moving average for anomaly detection
+#define HISTORY_SIZE 8
+static uint64_t period_history[HISTORY_SIZE] = {0};
+static uint8_t history_index = 0;
+static uint8_t history_count = 0;
 
 // ─── ISR ─────────────────────────────────────────────────────────────────────
 
@@ -122,6 +118,7 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 
     // ─── Method 2: Universal counter (alternating windows) ──────────────────
     if (first_edge_counter) {
+        // Very first pulse ever - just initialize
         window_start = now;
         pulse_count = 1;
         first_edge_counter = false;
@@ -129,11 +126,13 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
         pulse_count++;
         
         if (pulse_count == 2) {
+            // Second pulse: close the counting window and calculate period
             calculated_period = now - window_start;
         } else if (pulse_count == 3) {
+            // Third pulse: push the calculated period and open new window
             ring_push(&ring_counter, calculated_period);
             window_start = now;
-            pulse_count = 1;
+            pulse_count = 1;  // Reset for next window (this is pulse 1 of next window)
         }
     }
 
@@ -238,78 +237,90 @@ static void led_task(void *arg)
     }
 }
 
-// ─── Period history management ───────────────────────────────────────────────
+// ─── Anomaly detection ───────────────────────────────────────────────────────
 
-static void add_to_history(uint64_t period)
+static void update_period_history(uint64_t period)
 {
-    period_history.periods[period_history.index] = period;
-    period_history.index = (period_history.index + 1) % PERIOD_HISTORY_SIZE;
-    if (period_history.count < PERIOD_HISTORY_SIZE) {
-        period_history.count++;
+    period_history[history_index] = period;
+    history_index = (history_index + 1) % HISTORY_SIZE;
+    if (history_count < HISTORY_SIZE) {
+        history_count++;
     }
 }
 
 static float get_average_period(void)
 {
-    if (period_history.count == 0) return 0.0f;
+    if (history_count == 0) return 0.0f;
     
     uint64_t sum = 0;
-    for (uint8_t i = 0; i < period_history.count; i++) {
-        sum += period_history.periods[i];
+    for (uint8_t i = 0; i < history_count; i++) {
+        sum += period_history[i];
     }
-    return (float)sum / (float)period_history.count;
+    return (float)sum / (float)history_count;
 }
 
-static bool is_missing_magnet(uint64_t current_period)
+static bool detect_anomaly(uint64_t current_period, float* corrected_period)
 {
-    if (period_history.count < 4) {
-        return false;  // Need at least 4 samples for reliable detection
+    if (history_count < 3) {
+        // Need at least 3 samples to detect anomalies
+        return false;
     }
     
     float avg = get_average_period();
     float ratio = (float)current_period / avg;
     
-    return (ratio > OUTLIER_THRESHOLD);
+    // If current period is significantly longer than average, it's likely a missing magnet
+    if (ratio > ANOMALY_THRESHOLD) {
+        // Estimate how many magnets are missing and calculate corrected period
+        // For example, if ratio is ~2.0, likely 1 magnet missing (should be 2 magnets, not 1)
+        // Corrected period = current_period / ratio (approximately equal to average)
+        *corrected_period = avg;
+        return true;
+    }
+    
+    return false;
 }
 
 // ─── Helper function for speed/RPM calculation ───────────────────────────────
 
-static void calculate_and_print(uint64_t ticks, const char* method_name, float wheel_circumference_m)
+static void calculate_and_print(uint64_t ticks, const char* method_name, float wheel_circumference_m, bool is_anomaly, float corrected_ticks)
 {
     char buf[200];
     
-    // Check for missing magnet
-    bool missing_magnet = is_missing_magnet(ticks);
-    uint64_t corrected_ticks = ticks;
-    
-    if (missing_magnet) {
-        // If period is ~2x normal, assume one magnet was missed
-        // Divide by 2 to get the actual period per magnet
-        corrected_ticks = ticks / 2;
+    if (is_anomaly) {
+        // Use corrected period for calculation
+        float period_s = corrected_ticks / (float)TIMER_RESOLUTION_HZ;
+        float time_per_rev_s = period_s * MAGNETS_PER_REV;
+        float rpm = 60.0f / time_per_rev_s;
+        
+        float distance_per_pulse_m = wheel_circumference_m / MAGNETS_PER_REV;
+        float speed_ms = distance_per_pulse_m / period_s;
+        float speed_kmh = speed_ms * 3.6f;
+
+        int len = snprintf(buf, sizeof(buf),
+                           "[%s] Speed: %.2f km/h | RPM: %.1f | ⚠️ MISSING MAGNET (corrected)\r\n",
+                           method_name,
+                           speed_kmh,
+                           rpm);
+        uart_write_bytes(UART_PORT, buf, len);
+    } else {
+        // Normal calculation
+        float period_s = (float)ticks / (float)TIMER_RESOLUTION_HZ;
+        float time_per_rev_s = period_s * MAGNETS_PER_REV;
+        float rpm = 60.0f / time_per_rev_s;
+        
+        float distance_per_pulse_m = wheel_circumference_m / MAGNETS_PER_REV;
+        float speed_ms = distance_per_pulse_m / period_s;
+        float speed_kmh = speed_ms * 3.6f;
+
+        int len = snprintf(buf, sizeof(buf),
+                           "[%s] Speed: %.2f km/h | RPM: %.1f | Period: %.3f ms\r\n",
+                           method_name,
+                           speed_kmh,
+                           rpm,
+                           period_s * 1000.0f);
+        uart_write_bytes(UART_PORT, buf, len);
     }
-    
-    // Add to history (use corrected value for better averaging)
-    add_to_history(corrected_ticks);
-    
-    float period_s = (float)corrected_ticks / (float)TIMER_RESOLUTION_HZ;
-    float time_per_rev_s = period_s * MAGNETS_PER_REV;
-    float rpm = 60.0f / time_per_rev_s;
-    
-    float distance_per_pulse_m = wheel_circumference_m / MAGNETS_PER_REV;
-    float speed_ms = distance_per_pulse_m / period_s;
-    float speed_kmh = speed_ms * 3.6f;
-
-    const char* warning = missing_magnet ? " [MAGNET MISSING DETECTED!]" : "";
-    
-    int len = snprintf(buf, sizeof(buf),
-                       "[%s] Speed: %.2f km/h | RPM: %.1f | Period: %.3f ms%s\r\n",
-                       method_name,
-                       speed_kmh,
-                       rpm,
-                       period_s * 1000.0f,
-                       warning);
-
-    uart_write_bytes(UART_PORT, buf, len);
 }
 
 // ─── Processing task ─────────────────────────────────────────────────────────
@@ -335,8 +346,8 @@ static void measurement_task(void *arg)
                 timeout_displayed = true;
                 
                 // Reset history when stopped
-                period_history.count = 0;
-                period_history.index = 0;
+                history_count = 0;
+                history_index = 0;
             }
         } else {
             timeout_displayed = false;
@@ -346,11 +357,22 @@ static void measurement_task(void *arg)
         bool has_counter = ring_pop(&ring_counter, &ticks_counter);
         
         if (has_direct) {
-            calculate_and_print(ticks_direct, "DIRECT ", wheel_circumference_m);
+            // Check for anomaly
+            float corrected_ticks = 0;
+            bool is_anomaly = detect_anomaly(ticks_direct, &corrected_ticks);
+            
+            // Update history (only with non-anomalous values)
+            if (!is_anomaly) {
+                update_period_history(ticks_direct);
+            }
+            
+            calculate_and_print(ticks_direct, "DIRECT ", wheel_circumference_m, is_anomaly, corrected_ticks);
         }
         
         if (has_counter) {
-            calculate_and_print(ticks_counter, "COUNTER", wheel_circumference_m);
+            float corrected_ticks = 0;
+            bool is_anomaly = detect_anomaly(ticks_counter, &corrected_ticks);
+            calculate_and_print(ticks_counter, "COUNTER", wheel_circumference_m, is_anomaly, corrected_ticks);
         }
         
         // Print comparison if we have both measurements
@@ -382,24 +404,24 @@ void app_main(void)
     float wheel_circumference_m = (M_PI * WHEEL_DIAMETER_MM) / 1000.0f;
     char banner[600];
     int len = snprintf(banner, sizeof(banner),
-                       "\r\n=== Bicycle Speedometer - Dual Method with Magnet Loss Detection ===\r\n"
+                       "\r\n=== Bicycle Speedometer - Dual Method Comparison ===\r\n"
                        "Wheel diameter: %d mm\r\n"
                        "Wheel circumference: %.3f m\r\n"
                        "Magnets per revolution: %d\r\n"
                        "Hall sensor: GPIO %d | LED: GPIO %d\r\n"
                        "Timer resolution: 25 ns per tick\r\n"
                        "Timeout: %d ms (displays 0 km/h if no pulses)\r\n"
-                       "Magnet loss detection: ENABLED (threshold: %.1fx average period)\r\n\r\n"
+                       "Anomaly detection: %.1fx threshold for missing magnets\r\n\r\n"
                        "Method 1 (DIRECT):  Consecutive pulse differences\r\n"
-                       "Method 2 (COUNTER): Universal counter\r\n"
-                       "===================================================================\r\n\r\n",
+                       "Method 2 (COUNTER): Universal counter (pulse 1->2, calculate, pulse 3 opens new window)\r\n"
+                       "======================================================\r\n\r\n",
                        WHEEL_DIAMETER_MM,
                        wheel_circumference_m,
                        MAGNETS_PER_REV,
                        SIGNAL_GPIO,
                        LED_GPIO,
                        TIMEOUT_MS,
-                       OUTLIER_THRESHOLD);
+                       ANOMALY_THRESHOLD);
     uart_write_bytes(UART_PORT, banner, len);
 
     xTaskCreate(led_task, "led", 2048, NULL, 10, NULL);
@@ -407,22 +429,3 @@ void app_main(void)
     
     vTaskDelete(NULL);
 }
-/*
-**How the magnet loss detection works:**
-
-1. **Period history tracking**: Keeps the last 8 pulse periods in a circular buffer
-2. **Average calculation**: Computes the rolling average of recent periods
-3. **Outlier detection**: If current period > 1.7× average, it's flagged as a missing magnet
-4. **Auto-correction**: When detected, divides the period by 2 (assuming one magnet was skipped)
-5. **Warning message**: Displays "[MAGNET MISSING DETECTED!]" in the output
-
-**Key parameters you can adjust:**
-- `PERIOD_HISTORY_SIZE` (8) - How many samples to average
-- `OUTLIER_THRESHOLD` (1.7) - Sensitivity (lower = more sensitive, higher = fewer false positives)
-
-**Example output:**
-```
-[DIRECT ] Speed: 25.34 km/h | RPM: 87.2 | Period: 172.413 ms
-[DIRECT ] Speed: 25.30 km/h | RPM: 87.0 | Period: 344.826 ms [MAGNET MISSING DETECTED!]
-[DIRECT ] Speed: 25.35 km/h | RPM: 87.3 | Period: 172.100 ms
-*/
