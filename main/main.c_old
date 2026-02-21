@@ -17,8 +17,6 @@
 #include <stdbool.h>
 #include <math.h>
 
-
-
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 #define SIGNAL_GPIO         GPIO_NUM_27  // Hall sensor input
@@ -47,8 +45,8 @@
 
 // CYD LCD Configuration (ILI9341)
 #define LCD_HOST            SPI2_HOST
-#define LCD_V_RES           320
-#define LCD_H_RES           240
+#define LCD_H_RES           320
+#define LCD_V_RES           240
 #define LCD_PIXEL_CLK_HZ    (40 * 1000 * 1000)
 #define LCD_BK_LIGHT_ON     1
 #define LCD_BK_LIGHT_OFF    0
@@ -135,11 +133,11 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
 
     last_pulse_time = xTaskGetTickCountFromISR();
 
-    // Method 1: Direct consecutive pulse measurement   //TIEMPO ENTRE PULSOS CONSECUTIVOS
+    // Method 1: Direct consecutive pulse measurement
     if (first_edge_direct) {
         first_edge_direct = false;
     } else {
-        ring_push(&ring_direct, now - last_timestamp_direct);//TIEMPO ACTUAL - ANTERIOR
+        ring_push(&ring_direct, now - last_timestamp_direct);
     }
     last_timestamp_direct = now;
 
@@ -244,8 +242,8 @@ static void init_lcd(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(lcd_panel, false));
-     // ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, true, false));
-     ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, false, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, true, false));
+    
     // Set the display area to 320x240 (ILI9341 size)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel, true));
 }
@@ -262,15 +260,15 @@ static void init_lvgl_ui(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = lcd_io_handle,
         .panel_handle = lcd_panel,
-        .buffer_size = LCD_V_RES * 50, //LCD_H_RES EN VERTICAL
+        .buffer_size = LCD_H_RES * 50,
         .double_buffer = true,
-        .hres = LCD_V_RES, //INVIERTO PARA HORIZONTAL
-        .vres = LCD_H_RES,
+        .hres = LCD_H_RES,
+        .vres = LCD_V_RES,
         .monochrome = false,
         .rotation = {
-            .swap_xy = true, //f vertical
-            .mirror_x = false,//f vertical// antes true
-            .mirror_y = true,//f vertical
+            .swap_xy = false,
+            .mirror_x = true,
+            .mirror_y = false,
         }
     };
     lvgl_port_add_disp(&disp_cfg);
@@ -284,7 +282,7 @@ static void init_lvgl_ui(void)
 
     // Title
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "VELOCIMETRO");
+    lv_label_set_text(title, "BIKE SPEEDOMETER");
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
@@ -292,15 +290,13 @@ static void init_lvgl_ui(void)
     speed_label = lv_label_create(scr);
     lv_label_set_text(speed_label, "0.0 km/h");
     lv_obj_set_style_text_color(speed_label, lv_color_hex(0x00FF00), 0);
-    lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, 0);
-    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
 
     // RPM label
     rpm_label = lv_label_create(scr);
     lv_label_set_text(rpm_label, "RPM: 0.0");
     lv_obj_set_style_text_color(rpm_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(rpm_label, &lv_font_montserrat_48, 0);
-    lv_obj_align(rpm_label, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_align(rpm_label, LV_ALIGN_CENTER, 0, 40);
 
     // Status label
     status_label = lv_label_create(scr);
@@ -310,7 +306,7 @@ static void init_lvgl_ui(void)
 
     // Method label
     method_label = lv_label_create(scr);
-    lv_label_set_text(method_label, "METODO: DIRECTO");// ESTO NO ES LO QUE IMPRIME?
+    lv_label_set_text(method_label, "Method: DIRECT");
     lv_obj_set_style_text_color(method_label, lv_color_hex(0x808080), 0);
     lv_obj_align(method_label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
@@ -438,7 +434,7 @@ static void update_lcd_display(float speed_kmh, float rpm, const char* status, c
     lv_label_set_text(status_label, status);
     
     char method_text[64];
-    snprintf(method_text, sizeof(method_text), "METODOO: %s", method);
+    snprintf(method_text, sizeof(method_text), "Method: %s", method);
     lv_label_set_text(method_label, method_text);
     
     lvgl_port_unlock();
@@ -465,7 +461,7 @@ static void measurement_task(void *arg)
                 const char* timeout_msg = "Speed: 0.00 km/h | RPM: 0.0 | Wheel stopped\r\n\r\n";
                 uart_write_bytes(UART_PORT, timeout_msg, strlen(timeout_msg));
                 
-                update_lcd_display(0.0f, 0.0f, "RUEDA DETENIDA", "DIRECT");
+                update_lcd_display(0.0f, 0.0f, "Stopped", "DIRECT");
                 
                 timeout_displayed = true;
                 history_count = 0;
