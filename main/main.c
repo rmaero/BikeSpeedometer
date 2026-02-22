@@ -8,7 +8,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "led_strip.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 #include <stdio.h>
@@ -22,8 +21,11 @@
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 #define SIGNAL_GPIO         GPIO_NUM_27  // Hall sensor input
-#define LED_GPIO            GPIO_NUM_4   // Addressable LED data pin
-#define LED_STRIP_LENGTH    1            // Number of LEDs
+
+#define LED_R GPIO_NUM_4
+#define LED_G GPIO_NUM_16
+#define LED_B GPIO_NUM_17
+
 #define TIMER_RESOLUTION_HZ 40000000     // 40 MHz → 25 ns per tick (max for gptimer)
 
 #define UART_PORT           UART_NUM_0
@@ -71,7 +73,7 @@ typedef struct {
 static ring_buf_t ring_direct = {0};
 static ring_buf_t ring_counter = {0};
 
-static inline bool IRAM_ATTR ring_push(ring_buf_t *rb, uint64_t value)
+static inline bool IRAM_ATTR ring_push(ring_buf_t *rb, uint64_t value) //guarda valor nuevo en el buffer
 {
     uint32_t next = (rb->write_idx + 1) & RING_BUF_MASK;
     if (next == rb->read_idx) {
@@ -82,7 +84,7 @@ static inline bool IRAM_ATTR ring_push(ring_buf_t *rb, uint64_t value)
     return true;
 }
 
-static inline bool ring_pop(ring_buf_t *rb, uint64_t *out)
+static inline bool ring_pop(ring_buf_t *rb, uint64_t *out) //toma el ultimo valor nuevo del buffer
 {
     if (rb->read_idx == rb->write_idx) {
         return false;
@@ -95,72 +97,75 @@ static inline bool ring_pop(ring_buf_t *rb, uint64_t *out)
 // ─── Globals ─────────────────────────────────────────────────────────────────
 
 static gptimer_handle_t gptimer = NULL;
-static led_strip_handle_t led_strip = NULL;
+
+//manejo LCD
 static esp_lcd_panel_handle_t lcd_panel = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
-
 // LVGL UI elements
 static lv_obj_t *speed_label = NULL;
 static lv_obj_t *rpm_label = NULL;
 static lv_obj_t *status_label = NULL;
 static lv_obj_t *method_label = NULL;
 
-// Direct measurement state
+// Contador Continuo
 static volatile uint64_t last_timestamp_direct = 0;
 static volatile bool     first_edge_direct     = true;
 
-// Universal counter state
+// CUR
 static volatile uint64_t window_start = 0;
 static volatile uint64_t calculated_period = 0;
 static volatile uint8_t  pulse_count = 0;
 static volatile bool     first_edge_counter = true;
 
+//bandera para led testigo del pulso del sensor
 static volatile bool     trigger_led    = false;
 
-// Timeout detection
+// Timeout para rueda detenida
 static volatile TickType_t last_pulse_time = 0;
 
-// Moving average for anomaly detection
+// array para deteccion de iman perdido
+// guardo hasta los ultimo 8 valores y los promedio para comparar contra el nuevo periodo
 #define HISTORY_SIZE 8
 static uint64_t period_history[HISTORY_SIZE] = {0};
 static uint8_t history_index = 0;
 static uint8_t history_count = 0;
 
 // ─── ISR ─────────────────────────────────────────────────────────────────────
-
+//interrupcion
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
     uint64_t now = 0;
-    gptimer_get_raw_count(gptimer, &now);
+    gptimer_get_raw_count(gptimer, &now); //guardo valor del timer
 
-    last_pulse_time = xTaskGetTickCountFromISR();
+    //guardo el tiempo en el que se da el ultimo pulso para mas adelante chequear rueda detenida
+    last_pulse_time = xTaskGetTickCountFromISR(); 
 
-    // Method 1: Direct consecutive pulse measurement   //TIEMPO ENTRE PULSOS CONSECUTIVOS
-    if (first_edge_direct) {
+    // ContadorContinuo  //TIEMPO ENTRE PULSOS CONSECUTIVOS
+    if (first_edge_direct) { //si es el primer pulso que llega no guardar en el ringbuffer
         first_edge_direct = false;
     } else {
-        ring_push(&ring_direct, now - last_timestamp_direct);//TIEMPO ACTUAL - ANTERIOR
+        ring_push(&ring_direct, now - last_timestamp_direct); //TIEMPO ACTUAL - ANTERIOR
     }
-    last_timestamp_direct = now;
+    last_timestamp_direct = now; //guardo el valor actual como ultimo valor, para el pulso siguiente
 
     // Method 2: Universal counter (alternating windows)
-    if (first_edge_counter) {
+    if (first_edge_counter) { //abro la ventana de cuenta por primera vez
         window_start = now;
         pulse_count = 1;
         first_edge_counter = false;
     } else {
         pulse_count++;
         
-        if (pulse_count == 2) {
+        if (pulse_count == 2) { //cuando llega el segundo pulso se cierra la ventana de cuenta y guardo el valor en el buffer
             calculated_period = now - window_start;
-        } else if (pulse_count == 3) {
             ring_push(&ring_counter, calculated_period);
+        } else if (pulse_count == 3) { //en el tercer pulso vuelvo a abrir la ventana de cuenta y se reinicia la secuencia
             window_start = now;
-            pulse_count = 1;
+            pulse_count = 1; //tercer pulso es igual al primer pulso
         }
     }
 
-    trigger_led = true;
+    trigger_led = true; //bandera para prender el led
 }
 
 // ─── UART init ───────────────────────────────────────────────────────────────
@@ -284,7 +289,7 @@ static void init_lvgl_ui(void)
 
     // Title
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "VELOCIMETRO");
+    lv_label_set_text(title, "TP3 - MEDICIONES");
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
@@ -305,39 +310,21 @@ static void init_lvgl_ui(void)
     // Status label
     status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "Ready");
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0xFFFF00), 0);
-    lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), 0);
+    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -50);
 
     // Method label
     method_label = lv_label_create(scr);
-    lv_label_set_text(method_label, "METODO: DIRECTO");// ESTO NO ES LO QUE IMPRIME?
-    lv_obj_set_style_text_color(method_label, lv_color_hex(0x808080), 0);
+    lv_label_set_text(method_label, "PERIODO:");// ESTO NO ES LO QUE IMPRIME?
+    lv_obj_set_style_text_color(method_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(method_label, &lv_font_montserrat_20, 0);
     lv_obj_align(method_label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
     lvgl_port_unlock();
 }
 
-// ─── LED strip init ──────────────────────────────────────────────────────────
 
-static void init_led_strip(void)
-{
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = LED_GPIO,
-        .max_leds = LED_STRIP_LENGTH,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model = LED_MODEL_WS2812,
-        .flags.invert_out = false,
-    };
-
-    led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,
-        .flags.with_dma = false,
-    };
-
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    led_strip_clear(led_strip);
-}
 
 // ─── GPIO init ───────────────────────────────────────────────────────────────
 
@@ -350,13 +337,31 @@ static void init_gpio(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_NEGEDGE,
     };
+
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LED_R) |
+                        (1ULL << LED_G) |
+                        (1ULL << LED_B),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    gpio_config(&io_conf);
+
     ESP_ERROR_CHECK(gpio_config(&input_conf));
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SIGNAL_GPIO, gpio_isr_handler, NULL));
+
+    // Apagar todo (active LOW -> 1 apaga)
+    gpio_set_level(LED_R, 1);
+    gpio_set_level(LED_G, 1);
+    gpio_set_level(LED_B, 1);
 }
 
 // ─── LED control task ────────────────────────────────────────────────────────
-
+// este task esta para generar un delay de 20ms despues de la ISR y luego apagar el LED
 static void led_task(void *arg)
 {
     TickType_t led_off_time = 0;
@@ -366,15 +371,14 @@ static void led_task(void *arg)
         if (trigger_led) {
             trigger_led = false;
             
-            led_strip_set_pixel(led_strip, 0, 0, 255, 0);
-            led_strip_refresh(led_strip);
+            gpio_set_level(LED_G, 0); //prendo led
             
             led_is_on = true;
             led_off_time = xTaskGetTickCount() + pdMS_TO_TICKS(LED_PULSE_MS);
         }
 
         if (led_is_on && (xTaskGetTickCount() >= led_off_time)) {
-            led_strip_clear(led_strip);
+            gpio_set_level(LED_G, 1); //apago led
             led_is_on = false;
         }
 
@@ -423,7 +427,7 @@ static bool detect_anomaly(uint64_t current_period, float* corrected_period)
 
 // ─── Update LCD display ──────────────────────────────────────────────────────
 
-static void update_lcd_display(float speed_kmh, float rpm, const char* status, const char* method)
+static void update_lcd_display(float speed_kmh, float rpm, float period, const char* status)
 {
     lvgl_port_lock(0);
     
@@ -438,14 +442,14 @@ static void update_lcd_display(float speed_kmh, float rpm, const char* status, c
     lv_label_set_text(status_label, status);
     
     char method_text[64];
-    snprintf(method_text, sizeof(method_text), "METODOO: %s", method);
+    snprintf(method_text, sizeof(method_text), "PERIODO: %.3f s", period);
     lv_label_set_text(method_label, method_text);
     
     lvgl_port_unlock();
 }
 
 // ─── Processing task ─────────────────────────────────────────────────────────
-
+// funcion principal de calculo y display
 static void measurement_task(void *arg)
 {
     uint64_t ticks_direct;
@@ -456,17 +460,20 @@ static void measurement_task(void *arg)
     bool timeout_displayed = false;
 
     while (1) {
-        TickType_t current_time = xTaskGetTickCount();
-        TickType_t time_since_last_pulse = current_time - last_pulse_time;
+        TickType_t current_time = xTaskGetTickCount();                          //tomo el tiempo del sistema
+        TickType_t time_since_last_pulse = current_time - last_pulse_time;      //calcula cuanto paso desde el ultimo pulso recibido para rueda detenida
         
         // Check for timeout
+        //si paso mas tiempo del maximo permitido (aprox 2.2 seg) mostrar rueda detenida
         if (time_since_last_pulse > pdMS_TO_TICKS(TIMEOUT_MS)) {
             if (!timeout_displayed) {
+                //mostrar 0 kmh en display y por UART
                 const char* timeout_msg = "Speed: 0.00 km/h | RPM: 0.0 | Wheel stopped\r\n\r\n";
                 uart_write_bytes(UART_PORT, timeout_msg, strlen(timeout_msg));
                 
-                update_lcd_display(0.0f, 0.0f, "RUEDA DETENIDA", "DIRECT");
+                update_lcd_display(0.0f, 0.0f,0.0f ,"RUEDA DETENIDA");
                 
+                //uso esta bandera para mostrar una unica vez el mensaje
                 timeout_displayed = true;
                 history_count = 0;
                 history_index = 0;
@@ -475,6 +482,8 @@ static void measurement_task(void *arg)
             timeout_displayed = false;
         }
         
+
+        //tomo los valores de ticks de los ring buffer de ContadorContinuo y CUR respectivamente
         bool has_direct = ring_pop(&ring_direct, &ticks_direct);
         bool has_counter = ring_pop(&ring_counter, &ticks_counter);
         
@@ -497,7 +506,7 @@ static void measurement_task(void *arg)
             
             // Update LCD
             const char* status = is_anomaly ? "MISSING MAGNET" : "Running";
-            update_lcd_display(speed_kmh, rpm, status, "DIRECT");
+            update_lcd_display(speed_kmh, rpm, period_s, status);
             
             // UART output
             char buf[200];
@@ -563,7 +572,6 @@ void app_main(void)
     init_timer();
     init_lcd();
     init_lvgl_ui();
-    init_led_strip();
     init_gpio();
 
     float wheel_circumference_m = (M_PI * WHEEL_DIAMETER_MM) / 1000.0f;
@@ -585,7 +593,7 @@ void app_main(void)
                        wheel_circumference_m,
                        MAGNETS_PER_REV,
                        SIGNAL_GPIO,
-                       LED_GPIO,
+                       LED_G,
                        TIMEOUT_MS,
                        ANOMALY_THRESHOLD,
                        LCD_H_RES, LCD_V_RES);
