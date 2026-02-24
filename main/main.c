@@ -45,7 +45,7 @@
 
 // Bicycle wheel configuration
 #define MAGNETS_PER_REV     4            // Number of magnets on the wheel
-#define WHEEL_DIAMETER_MM   700          // Wheel diameter in millimeters
+#define WHEEL_DIAMETER_MM   750          // Wheel diameter in millimeters
 
 // CYD LCD Configuration (ILI9341)
 #define LCD_HOST            SPI2_HOST
@@ -61,6 +61,9 @@
 #define PIN_LCD_DC          GPIO_NUM_2
 #define PIN_LCD_RST         GPIO_NUM_12
 #define PIN_LCD_BL          GPIO_NUM_21
+
+// Display smoothing
+#define DISPLAY_AVG_SIZE    4            // Average last 4 measurements for display
 
 // ─── Ring buffers ────────────────────────────────────────────────────────────
 
@@ -129,6 +132,13 @@ static volatile TickType_t last_pulse_time = 0;
 static uint64_t period_history[HISTORY_SIZE] = {0};
 static uint8_t history_index = 0;
 static uint8_t history_count = 0;
+
+// Arrays para promediar valores del display
+static float speed_history[DISPLAY_AVG_SIZE] = {0};
+static float rpm_history[DISPLAY_AVG_SIZE] = {0};
+static float period_history_display[DISPLAY_AVG_SIZE] = {0};
+static uint8_t display_index = 0;
+static uint8_t display_count = 0;
 
 // ─── ISR ─────────────────────────────────────────────────────────────────────
 //interrupcion
@@ -249,8 +259,7 @@ static void init_lcd(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(lcd_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(lcd_panel, false));
-     // ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, true, false));
-     ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, false, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(lcd_panel, false, false));
     // Set the display area to 320x240 (ILI9341 size)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel, true));
 }
@@ -425,6 +434,64 @@ static bool detect_anomaly(uint64_t current_period, float* corrected_period)
     return false;
 }
 
+// ─── Display averaging functions ─────────────────────────────────────────────
+
+static void update_display_history(float speed, float rpm, float period)
+{
+    speed_history[display_index] = speed;
+    rpm_history[display_index] = rpm;
+    period_history_display[display_index] = period;
+    
+    display_index = (display_index + 1) % DISPLAY_AVG_SIZE;
+    if (display_count < DISPLAY_AVG_SIZE) {
+        display_count++;
+    }
+}
+
+static float get_average_speed(void)
+{
+    if (display_count == 0) return 0.0f;
+    
+    float sum = 0;
+    for (uint8_t i = 0; i < display_count; i++) {
+        sum += speed_history[i];
+    }
+    return sum / (float)display_count;
+}
+
+static float get_average_rpm(void)
+{
+    if (display_count == 0) return 0.0f;
+    
+    float sum = 0;
+    for (uint8_t i = 0; i < display_count; i++) {
+        sum += rpm_history[i];
+    }
+    return sum / (float)display_count;
+}
+
+static float get_average_period_display(void)
+{
+    if (display_count == 0) return 0.0f;
+    
+    float sum = 0;
+    for (uint8_t i = 0; i < display_count; i++) {
+        sum += period_history_display[i];
+    }
+    return sum / (float)display_count;
+}
+
+static void reset_display_history(void)
+{
+    display_count = 0;
+    display_index = 0;
+    for (uint8_t i = 0; i < DISPLAY_AVG_SIZE; i++) {
+        speed_history[i] = 0.0f;
+        rpm_history[i] = 0.0f;
+        period_history_display[i] = 0.0f;
+    }
+}
+
 // ─── Update LCD display ──────────────────────────────────────────────────────
 
 static void update_lcd_display(float speed_kmh, float rpm, float period, const char* status)
@@ -471,7 +538,9 @@ static void measurement_task(void *arg)
                 const char* timeout_msg = "Speed: 0.00 km/h | RPM: 0.0 | Wheel stopped\r\n\r\n";
                 uart_write_bytes(UART_PORT, timeout_msg, strlen(timeout_msg));
                 
-                update_lcd_display(0.0f, 0.0f,0.0f ,"RUEDA DETENIDA");
+                // Reset display history and show zeros
+                reset_display_history();
+                update_lcd_display(0.0f, 0.0f, 0.0f, "RUEDA DETENIDA");
                 
                 //uso esta bandera para mostrar una unica vez el mensaje
                 timeout_displayed = true;
@@ -504,11 +573,19 @@ static void measurement_task(void *arg)
             float speed_ms = distance_per_pulse_m / period_s;
             float speed_kmh = speed_ms * 3.6f;
             
-            // Update LCD
-            const char* status = is_anomaly ? "MISSING MAGNET" : "Running";
-            update_lcd_display(speed_kmh, rpm, period_s, status);
+            // Update display history with new values
+            update_display_history(speed_kmh, rpm, period_s);
             
-            // UART output
+            // Get averaged values for display
+            float avg_speed = get_average_speed();
+            float avg_rpm = get_average_rpm();
+            float avg_period = get_average_period_display();
+            
+            // Update LCD with averaged values
+            const char* status = is_anomaly ? "MISSING MAGNET" : "Running";
+            update_lcd_display(avg_speed, avg_rpm, avg_period, status);
+            
+            // UART output (still shows instantaneous values)
             char buf[200];
             if (is_anomaly) {
                 int len = snprintf(buf, sizeof(buf),
@@ -585,6 +662,7 @@ void app_main(void)
                        "Timer resolution: 25 ns per tick\r\n"
                        "Timeout: %d ms (displays 0 km/h if no pulses)\r\n"
                        "Anomaly detection: %.1fx threshold for missing magnets\r\n"
+                       "Display averaging: last %d measurements\r\n"
                        "LCD: %dx%d ILI9341\r\n\r\n"
                        "Method 1 (DIRECT):  Consecutive pulse differences\r\n"
                        "Method 2 (COUNTER): Universal counter\r\n"
@@ -596,6 +674,7 @@ void app_main(void)
                        LED_G,
                        TIMEOUT_MS,
                        ANOMALY_THRESHOLD,
+                       DISPLAY_AVG_SIZE,
                        LCD_H_RES, LCD_V_RES);
     uart_write_bytes(UART_PORT, banner, len);
 
