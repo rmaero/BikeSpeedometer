@@ -417,6 +417,8 @@ static float get_average_period(void)
     return (float)sum / (float)history_count;
 }
 
+//chequeo si el ultimo periodo es mayor al umbral permitido,
+//en ese caso, descarto y utilizo la media de las mediciones anteriores
 static bool detect_anomaly(uint64_t current_period, float* corrected_period)
 {
     if (history_count < 3) {
@@ -525,6 +527,8 @@ static void measurement_task(void *arg)
     float wheel_circumference_m = (M_PI * WHEEL_DIAMETER_MM) / 1000.0f;
     
     bool timeout_displayed = false;
+    TickType_t last_display_update = 0;  // Track last display update time
+    const TickType_t display_update_interval = pdMS_TO_TICKS(500);  // 500ms update interval
 
     while (1) {
         TickType_t current_time = xTaskGetTickCount();                          //tomo el tiempo del sistema
@@ -541,6 +545,7 @@ static void measurement_task(void *arg)
                 // Reset display history and show zeros
                 reset_display_history();
                 update_lcd_display(0.0f, 0.0f, 0.0f, "RUEDA DETENIDA");
+                last_display_update = current_time;  // Reset display timer
                 
                 //uso esta bandera para mostrar una unica vez el mensaje
                 timeout_displayed = true;
@@ -573,17 +578,22 @@ static void measurement_task(void *arg)
             float speed_ms = distance_per_pulse_m / period_s;
             float speed_kmh = speed_ms * 3.6f;
             
-            // Update display history with new values
+            // Update display history with new values (always collect data)
             update_display_history(speed_kmh, rpm, period_s);
             
-            // Get averaged values for display
-            float avg_speed = get_average_speed();
-            float avg_rpm = get_average_rpm();
-            float avg_period = get_average_period_display();
-            
-            // Update LCD with averaged values
-            const char* status = is_anomaly ? "MISSING MAGNET" : "Running";
-            update_lcd_display(avg_speed, avg_rpm, avg_period, status);
+            // Only update display every 500ms
+            if ((current_time - last_display_update) >= display_update_interval) {
+                // Get averaged values for display
+                float avg_speed = get_average_speed();
+                float avg_rpm = get_average_rpm();
+                float avg_period = get_average_period_display();
+                
+                // Update LCD with averaged values
+                const char* status = is_anomaly ? "MISSING MAGNET" : "Running";
+                update_lcd_display(avg_speed, avg_rpm, avg_period, status);
+                
+                last_display_update = current_time;  // Update the timer
+            }
             
             // UART output (still shows instantaneous values)
             char buf[200];
